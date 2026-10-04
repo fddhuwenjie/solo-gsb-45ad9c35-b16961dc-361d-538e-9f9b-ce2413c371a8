@@ -77,6 +77,18 @@
   阈值一致时才用保存版本的特征库重跑判定；重跑是纯计算，**不写入
   ``judgments``**，报告只写本表。同键重试返回原报告，改设备/判定目标 409。
 
+复核新判定采纳（``changed`` 报告 → 设备批次判定的现行结果）：
+
+- ``batch_judgment_adoptions``：一次采纳的不可变记录——全局唯一幂等键、
+  设备、原批次判定（唯一，至多采纳一次）、来源复核报告、替代判定
+  （``judgments`` 新行）与完整采纳 JSON（原/现行候选证据与差异字段）。
+  采纳在**单个 BEGIN IMMEDIATE 写事务**内重新核对：批次未归档、来源
+  摘要/前序链/阈值与原判定一致，用原 ``library_version`` 重跑判定并核对
+  结果与报告的新候选和差异完全一致；来源变化或复核结果不一致整体 409
+  回滚，不留部分采纳。成功后原判定与 ``/judgments`` 历史保持可查，
+  批次判定详情同时给出原结果与现行结果；同键同目标重试返回原采纳结果，
+  改目标或他键争抢同一原判定 409。
+
 设备链一致性核验（离线补传、归档或迁移后的运维核对）：
 
 - ``verify_chain`` 在**单个只读事务**（``PRAGMA query_only`` 兜底）内固定
@@ -297,6 +309,21 @@ CREATE TABLE IF NOT EXISTS batch_judgment_review_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_bj_review_reports_judgment
     ON batch_judgment_review_reports (device_id, batch_judgment_id, report_id);
+CREATE TABLE IF NOT EXISTS batch_judgment_adoptions (
+    adoption_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key   TEXT NOT NULL UNIQUE,
+    device_id         TEXT NOT NULL,
+    batch_judgment_id INTEGER NOT NULL REFERENCES batch_judgments(id),
+    report_id         INTEGER NOT NULL
+        REFERENCES batch_judgment_review_reports(report_id),
+    judgment_id       INTEGER NOT NULL REFERENCES judgments(id),
+    adoption          TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    -- 每个原批次判定至多被采纳一次：他键争抢同一原判定返回 409
+    UNIQUE (batch_judgment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bj_adoptions_device
+    ON batch_judgment_adoptions (device_id, adoption_id);
 CREATE TABLE IF NOT EXISTS batch_leases (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id          TEXT NOT NULL,
@@ -458,6 +485,25 @@ class ReviewReportConflict(Exception):
     def __init__(self, *, message: str, **extra):
         super().__init__(message)
         self.detail = {"error": "review_report_conflict", "message": message}
+        self.detail.update(extra)
+
+
+class ReviewReportNotFound(Exception):
+    """采纳来源的复核报告不存在（HTTP 404）。"""
+
+    def __init__(self, *, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "review_report_not_found", "message": message}
+        self.detail.update(extra)
+
+
+class AdoptionConflict(Exception):
+    """复核新判定采纳冲突（HTTP 409）：报告目标/结论不符、来源已变化、
+    复核结果不一致、幂等键被占用或原判定已被采纳。"""
+
+    def __init__(self, *, reason: str, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "adoption_conflict", "reason": reason, "message": message}
         self.detail.update(extra)
 
 
@@ -2334,7 +2380,13 @@ class Database:
         ]
 
     def _get_batch_judgment(self, conn, batch_judgment_id: int) -> dict | None:
-        """在给定连接内组装一次连续批次判定的完整不可变来源。"""
+        """在给定连接内组装一次连续批次判定的完整不可变来源。
+
+        采纳复核新判定后另带 ``current_judgment_id``（现行判定 id，未采纳时
+        等于 ``source_judgment_id``）与 ``adoption``（采纳元信息 + 现行判定
+        响应；未采纳为 ``None``）——``judgment`` 始终是原判定结果，两者
+        同时可查。
+        """
         r = conn.execute(
             "SELECT * FROM batch_judgments WHERE id = ?", (batch_judgment_id,)
         ).fetchone()
@@ -2350,6 +2402,7 @@ class Database:
             # judgments 保存的是回填 id 前的响应（同 GET /judgments/{id}），
             # 这里补上来源判定 id 便于直接复核
             judgment_payload["judgment_id"] = r["judgment_id"]
+        adoption = self._batch_judgment_adoption(conn, batch_judgment_id)
         return {
             "batch_judgment_id": r["id"],
             "idempotency_key": r["idempotency_key"],
@@ -2361,9 +2414,15 @@ class Database:
             "thresholds": json.loads(r["thresholds"]),
             "observations": json.loads(r["observations"]),
             "source_judgment_id": r["judgment_id"],
+            "current_judgment_id": (
+                adoption["replacement_judgment_id"]
+                if adoption is not None
+                else r["judgment_id"]
+            ),
             "created_at": _iso(r["created_at"]),
             "batches": self._batch_judgment_batches(conn, r["id"]),
             "judgment": judgment_payload,
+            "adoption": adoption,
         }
 
     def get_batch_judgment(self, device_id: str, batch_judgment_id: int) -> dict | None:
@@ -2456,7 +2515,7 @@ class Database:
             conn.execute("PRAGMA query_only = ON")  # 只读兜底：复核绝不写数据
             try:
                 conn.execute("BEGIN")  # 只读事务：以下全部读取固定于同一快照
-                report_body = self._review_batch_judgment(
+                report_body, _current_response = self._review_batch_judgment(
                     conn, device_id, batch_judgment_id, runner
                 )
             finally:
@@ -2517,14 +2576,20 @@ class Database:
 
     def _review_batch_judgment(
         self, conn, device_id: str, batch_judgment_id: int, runner
-    ) -> dict:
-        """在只读事务连接内复核一次连续批次判定（快照由调用方的事务保证）。
+    ) -> tuple[dict, dict | None]:
+        """在给定事务连接内复核一次连续批次判定（快照由调用方的事务保证）。
 
         固定 ``batch_judgments`` 不可变记录、各批摘要与保存的
         ``library_version``，逐批核对当前批次链（已归档墓碑只核对摘要骨架、
         没有明细）；只有所有明细可用且摘要、前序链和阈值一致时，才用保存
         版本的特征库由 ``runner`` 重跑判定（与 /judge 同一算法）并逐字段
         比较新旧裁决。纯读取 + 纯计算：不写任何表，尤其不写 ``judgments``。
+
+        返回 ``(report_body, current_response)``：``report_body`` 为报告
+        正文（结论、问题清单、差异字段与原/新候选证据）；
+        ``current_response`` 为重跑的完整判定响应（与 /judge 响应结构一致，
+        未重跑时为 ``None``）——复核报告只保存证据摘要，采纳操作则需要
+        完整响应落库为替代判定。
         """
         _issue = self._verify_issue
         bj = conn.execute(
@@ -2694,6 +2759,7 @@ class Database:
         )
         differences: list[dict] = []
         current_evidence = None
+        current_response = None
         mismatch = any(
             i["issue_code"] in self._REVIEW_MISMATCH_CODES for i in issues
         )
@@ -2774,7 +2840,7 @@ class Database:
             "differences": differences,
             "saved": saved_evidence,
             "current": current_evidence,
-        }
+        }, current_response
 
     @staticmethod
     def _review_evidence(response: dict, *, judgment_id) -> dict:
@@ -2890,6 +2956,334 @@ class Database:
             "count": len(items),
             "review_reports": items,
             "next_cursor": items[-1]["report_id"] if has_more and items else None,
+        }
+
+    # ---------------- 复核新判定采纳（changed 报告 → 现行结果，单事务重核） ----------------
+
+    def adopt_batch_judgment_review(
+        self,
+        device_id: str,
+        batch_judgment_id: int,
+        report_id: int,
+        idempotency_key: str,
+        runner,
+    ) -> tuple[dict, bool]:
+        """采纳 changed 复核报告的新判定为设备批次判定的现行结果（单事务，幂等）。
+
+        整个流程在单个 BEGIN IMMEDIATE 写事务内完成，任一核对失败整体回滚，
+        不会留下部分采纳：
+
+        1. 幂等键裁决：相同键 + 相同设备/判定/报告重试返回原采纳结果
+           （``created=False``，HTTP 200）；相同键用于其他目标抛
+           :class:`AdoptionConflict`（``idempotency_key_in_use``，409）；
+        2. 目标判定必须存在且属于该设备（否则 404）；来源报告必须存在
+           （否则 404）、属于同设备同判定目标且结论为 ``changed``
+           （否则 409 ``report_target_mismatch`` / ``report_not_changed``）；
+        3. 同一原判定至多被采纳一次：已被其他键采纳抛 ``already_adopted``
+           （409）；
+        4. 在同一事务内重新核对来源（批次未归档、各批摘要/前序链/阈值与
+           原判定一致）并用原 ``library_version`` 重跑判定：来源已变化
+           （缺失/不符）抛 ``source_changed``（409，附问题清单），重跑
+           结果与报告的新候选和差异不一致抛 ``review_result_mismatch``
+           （409，附两侧差异）；
+        5. 全部通过后在同事务把重跑结果写入 ``judgments`` 新行（原判定
+           记录不动），再落不可变采纳记录（含来源报告 id 与原/现行候选
+           证据）；幂等键与 (batch_judgment_id) 唯一约束兜底多 worker
+           并发，撞键/撞判定时回滚已写的判定行并按同一语义裁决。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            resolved = self._adoption_key_resolution(
+                conn, idempotency_key, device_id, batch_judgment_id, report_id
+            )
+            if resolved is not None:
+                return resolved, False
+
+            bj = conn.execute(
+                "SELECT * FROM batch_judgments WHERE id = ?", (batch_judgment_id,)
+            ).fetchone()
+            if bj is None or bj["device_id"] != device_id:
+                raise BatchJudgmentNotFound(
+                    message=(
+                        f"batch judgment {batch_judgment_id} of device "
+                        f"{device_id!r} not found"
+                    ),
+                    device_id=device_id,
+                    batch_judgment_id=batch_judgment_id,
+                )
+            report_row = conn.execute(
+                "SELECT * FROM batch_judgment_review_reports WHERE report_id = ?",
+                (report_id,),
+            ).fetchone()
+            if report_row is None:
+                raise ReviewReportNotFound(
+                    message=(
+                        f"review report {report_id} of device {device_id!r} "
+                        f"not found"
+                    ),
+                    device_id=device_id,
+                    batch_judgment_id=batch_judgment_id,
+                    report_id=report_id,
+                )
+            if (
+                report_row["device_id"] != device_id
+                or report_row["batch_judgment_id"] != batch_judgment_id
+            ):
+                raise AdoptionConflict(
+                    reason="report_target_mismatch",
+                    message=(
+                        f"review report {report_id} belongs to device "
+                        f"{report_row['device_id']!r} batch judgment "
+                        f"{report_row['batch_judgment_id']}; only a report of "
+                        f"the same device and the same batch judgment "
+                        f"{batch_judgment_id} can be adopted"
+                    ),
+                    device_id=device_id,
+                    batch_judgment_id=batch_judgment_id,
+                    report_id=report_id,
+                    report_device_id=report_row["device_id"],
+                    report_batch_judgment_id=report_row["batch_judgment_id"],
+                )
+            report_body = json.loads(report_row["report"])
+            if report_body["status"] != "changed":
+                raise AdoptionConflict(
+                    reason="report_not_changed",
+                    message=(
+                        f"review report {report_id} concluded "
+                        f"{report_body['status']!r}; only a 'changed' report "
+                        "can be adopted"
+                    ),
+                    device_id=device_id,
+                    batch_judgment_id=batch_judgment_id,
+                    report_id=report_id,
+                    report_status=report_body["status"],
+                )
+            prior = conn.execute(
+                "SELECT * FROM batch_judgment_adoptions WHERE batch_judgment_id = ?",
+                (batch_judgment_id,),
+            ).fetchone()
+            if prior is not None:
+                raise self._already_adopted_conflict(
+                    device_id, batch_judgment_id, prior
+                )
+
+            # 同一事务内重新核对来源并用保存版本重跑（与复核同一逻辑）
+            recheck, current_response = self._review_batch_judgment(
+                conn, device_id, batch_judgment_id, runner
+            )
+            if recheck["status"] in ("source_unavailable", "source_mismatch"):
+                raise AdoptionConflict(
+                    reason="source_changed",
+                    message=(
+                        f"sources of batch judgment {batch_judgment_id} changed "
+                        f"since review report {report_id}: re-check concluded "
+                        f"{recheck['status']!r}; investigate and create a fresh "
+                        "review report before adopting"
+                    ),
+                    device_id=device_id,
+                    batch_judgment_id=batch_judgment_id,
+                    report_id=report_id,
+                    recheck_status=recheck["status"],
+                    issues=recheck["issues"],
+                )
+            if (
+                recheck["status"] != "changed"
+                or recheck["differences"] != report_body["differences"]
+                or recheck["saved"] != report_body["saved"]
+                or recheck["current"] != report_body["current"]
+            ):
+                raise AdoptionConflict(
+                    reason="review_result_mismatch",
+                    message=(
+                        f"re-run of batch judgment {batch_judgment_id} with its "
+                        f"saved library_version no longer matches review report "
+                        f"{report_id}; create a fresh review report before "
+                        "adopting"
+                    ),
+                    device_id=device_id,
+                    batch_judgment_id=batch_judgment_id,
+                    report_id=report_id,
+                    recheck_status=recheck["status"],
+                    report_differences=report_body["differences"],
+                    recheck_differences=recheck["differences"],
+                    report_current=report_body["current"],
+                    recheck_current=recheck["current"],
+                )
+
+            # 来源与复核结果均在本事务内核实一致：落替代判定与不可变采纳记录
+            library_version = bj["library_version"]
+            jrow = conn.execute(
+                "SELECT request FROM judgments WHERE id = ?",
+                (bj["judgment_id"],),
+            ).fetchone()
+            original_request = json.loads(jrow["request"])
+            best = current_response["best"]
+            # 保存点：唯一约束兜底并发同键/同判定时，回滚本请求已写的
+            # judgments 行，绝不留下孤儿判定或部分采纳
+            conn.execute("SAVEPOINT batch_judgment_adoption")
+            replacement_judgment_id = self._insert_judgment(
+                conn,
+                status=current_response["status"],
+                best_aid_id=best["aid_id"] if best is not None else None,
+                matched=best["matched"] if best is not None else 0,
+                missed=best["missed"] if best is not None else 0,
+                false_count=best["false"] if best is not None else 0,
+                drift=best["drift"] if best is not None else None,
+                library_version=library_version,
+                request=original_request,
+                response=current_response,
+            )
+            current_response["judgment_id"] = replacement_judgment_id
+            adoption_body = {
+                "source_judgment_id": bj["judgment_id"],
+                "replacement_judgment_id": replacement_judgment_id,
+                "library_version": library_version,
+                "from_sequence": bj["from_sequence"],
+                "to_sequence": bj["to_sequence"],
+                "differences": recheck["differences"],
+                "original": recheck["saved"],
+                "current": self._review_evidence(
+                    current_response, judgment_id=replacement_judgment_id
+                ),
+            }
+            try:
+                cur = conn.execute(
+                    "INSERT INTO batch_judgment_adoptions "
+                    "(idempotency_key, device_id, batch_judgment_id, report_id, "
+                    "judgment_id, adoption, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        device_id,
+                        batch_judgment_id,
+                        report_id,
+                        replacement_judgment_id,
+                        json.dumps(adoption_body, ensure_ascii=False),
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 唯一约束兜底并发：同键被抢先占用按同一语义裁决；同判定被
+                # 他键抢先采纳报 already_adopted。先回滚本请求写入的判定行
+                conn.execute("ROLLBACK TO SAVEPOINT batch_judgment_adoption")
+                resolved = self._adoption_key_resolution(
+                    conn, idempotency_key, device_id, batch_judgment_id, report_id
+                )
+                if resolved is not None:
+                    return resolved, False
+                prior = conn.execute(
+                    "SELECT * FROM batch_judgment_adoptions "
+                    "WHERE batch_judgment_id = ?",
+                    (batch_judgment_id,),
+                ).fetchone()
+                if prior is not None:
+                    raise self._already_adopted_conflict(
+                        device_id, batch_judgment_id, prior
+                    )
+                raise  # 防御：非键/判定占用的约束错误不应发生
+            conn.execute("RELEASE SAVEPOINT batch_judgment_adoption")
+            saved = self._get_adoption(conn, int(cur.lastrowid))
+        return saved, True
+
+    def _adoption_key_resolution(
+        self,
+        conn,
+        idempotency_key: str,
+        device_id: str,
+        batch_judgment_id: int,
+        report_id: int,
+    ) -> dict | None:
+        """采纳幂等键裁决：键未使用返回 None；同设备同判定同报告返回原采纳
+        结果；键被其他目标占用抛 :class:`AdoptionConflict`。"""
+        row = conn.execute(
+            "SELECT * FROM batch_judgment_adoptions WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (
+            row["device_id"] == device_id
+            and row["batch_judgment_id"] == batch_judgment_id
+            and row["report_id"] == report_id
+        ):
+            return self._adoption_view(row)
+        raise AdoptionConflict(
+            reason="idempotency_key_in_use",
+            message=(
+                f"idempotency_key {idempotency_key!r} is already used by "
+                f"adoption {row['adoption_id']} of device {row['device_id']!r} "
+                f"batch judgment {row['batch_judgment_id']} (report "
+                f"{row['report_id']})"
+            ),
+            idempotency_key=idempotency_key,
+            occupied_by_adoption_id=row["adoption_id"],
+            occupied_device_id=row["device_id"],
+            occupied_batch_judgment_id=row["batch_judgment_id"],
+            occupied_report_id=row["report_id"],
+        )
+
+    def _already_adopted_conflict(
+        self, device_id: str, batch_judgment_id: int, prior
+    ) -> AdoptionConflict:
+        return AdoptionConflict(
+            reason="already_adopted",
+            message=(
+                f"batch judgment {batch_judgment_id} of device {device_id!r} "
+                f"was already adopted by adoption {prior['adoption_id']} "
+                f"(report {prior['report_id']}); the original judgment can be "
+                "adopted at most once"
+            ),
+            device_id=device_id,
+            batch_judgment_id=batch_judgment_id,
+            occupied_by_adoption_id=prior["adoption_id"],
+            occupied_report_id=prior["report_id"],
+            occupied_idempotency_key=prior["idempotency_key"],
+        )
+
+    @staticmethod
+    def _adoption_view(row) -> dict:
+        body = json.loads(row["adoption"])
+        return {
+            "adoption_id": row["adoption_id"],
+            "idempotency_key": row["idempotency_key"],
+            "device_id": row["device_id"],
+            "batch_judgment_id": row["batch_judgment_id"],
+            "report_id": row["report_id"],
+            "created_at": _iso(row["created_at"]),
+            **body,
+        }
+
+    def _get_adoption(self, conn, adoption_id: int) -> dict | None:
+        row = conn.execute(
+            "SELECT * FROM batch_judgment_adoptions WHERE adoption_id = ?",
+            (adoption_id,),
+        ).fetchone()
+        return self._adoption_view(row) if row is not None else None
+
+    def _batch_judgment_adoption(self, conn, batch_judgment_id: int) -> dict | None:
+        """批次判定的现行采纳（未被采纳时为 None）：采纳元信息 + 现行判定响应。"""
+        row = conn.execute(
+            "SELECT * FROM batch_judgment_adoptions WHERE batch_judgment_id = ?",
+            (batch_judgment_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        judgment = conn.execute(
+            "SELECT response FROM judgments WHERE id = ?", (row["judgment_id"],)
+        ).fetchone()
+        judgment_payload = (
+            json.loads(judgment["response"]) if judgment is not None else None
+        )
+        if judgment_payload is not None:
+            # judgments 保存的是回填 id 前的响应，这里补上替代判定 id
+            judgment_payload["judgment_id"] = row["judgment_id"]
+        return {
+            "adoption_id": row["adoption_id"],
+            "idempotency_key": row["idempotency_key"],
+            "report_id": row["report_id"],
+            "replacement_judgment_id": row["judgment_id"],
+            "created_at": _iso(row["created_at"]),
+            "judgment": judgment_payload,
         }
 
     # ---------------- 设备链一致性核验（只读快照，不改数据） ----------------
