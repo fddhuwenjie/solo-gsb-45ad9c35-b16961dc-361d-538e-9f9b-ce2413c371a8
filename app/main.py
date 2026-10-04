@@ -6,6 +6,8 @@ from fastapi import FastAPI, HTTPException, Path, Query, Response
 from . import config
 from .align import AidPattern, judge
 from .db import (
+    AdoptionConflict,
+    AdoptionNotFound,
     ArchiveConflict,
     BatchConflict,
     BatchJudgmentConflict,
@@ -27,6 +29,7 @@ from .db import (
 from .models import (
     ArchiveRequest,
     BatchAckRequest,
+    BatchJudgmentAdoptionRequest,
     BatchJudgmentRequest,
     BatchJudgmentReviewRequest,
     BatchUploadRequest,
@@ -141,8 +144,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "返回 unchanged/changed 及差异字段与原/新候选证据，来源缺失或摘要"
             "不符返回 source_unavailable/source_mismatch，不写入 judgments；"
             "同键重试返回原报告，改设备或判定目标 409。"
+            "复核为 changed 时可采纳新判定为现行结果：提交报告 id 与幂等键，"
+            "仅接收同设备同目标且 changed 的报告；单个写事务内重新核对批次"
+            "未归档且来源摘要/前序链/阈值与原判定一致，用原 library_version "
+            "重跑并核对结果与报告新候选和差异，来源变化或结果不一致 409 且"
+            "整体回滚；成功后保存不可变替代结果及来源报告，原判定与 "
+            "/judgments 历史仍可查，原判定详情同时给出原结果与现行结果，"
+            "同键同目标重试 200、改目标或他键争抢 409。"
         ),
-        version="1.12.0",
+        version="1.13.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -966,6 +976,103 @@ def create_app(db_path: str | None = None) -> FastAPI:
         )
         if row is None:
             raise HTTPException(status_code=404, detail="review report not found")
+        return row
+
+    # -------- 采纳 changed 复核报告的新判定为现行结果（单事务，幂等） --------
+
+    @app.post(
+        "/field-devices/{device_id}/batch-judgments/{batch_judgment_id}/adoptions",
+        status_code=201,
+        summary="采纳 changed 复核报告的新判定为批次判定现行结果（单事务，幂等）",
+        description=(
+            "提交复核报告 id 与幂等键；仅接收同设备、同目标判定且结论为 "
+            "changed 的报告。服务在单个 SQLite 写事务（BEGIN IMMEDIATE）内"
+            "重新核对批次未归档且来源摘要、前序链和四项阈值与原判定一致，再"
+            "用原 library_version 的特征库重跑判定，并核对重跑结果与报告的"
+            "新候选证据（current）、差异清单（differences）及报告原候选与原"
+            "判定记录一致。来源变化（source_mismatch）、批次已归档/缺失"
+            "（source_unavailable）或复核结果不一致（review_result_mismatch）"
+            "均返回 409 并整体回滚，不留下部分采纳。成功后把不可变替代结果"
+            "写入 judgments 并保存采纳记录（含来源报告快照）：原判定与"
+            " /judgments 历史仍可查，原批次判定详情同时给出原结果与现行结果。"
+            "相同幂等键且同设备/判定/报告重试返回原采纳（HTTP 200）；同键"
+            "改目标返回 409（idempotency_key_in_use）；用其他键争抢同一原"
+            "判定返回 409（already_adopted）。设备隔离期间本接口返回 409"
+            "（device_isolated）。"
+        ),
+    )
+    def adopt_device_batch_judgment_review_report(
+        req: BatchJudgmentAdoptionRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+        batch_judgment_id: int = Path(ge=1),
+    ) -> dict:
+        def runner(observations, thresholds, library_version, stored_aids):
+            # 与批次判定/复核完全相同的判定算法：原 library_version 的不可变快照
+            patterns = [
+                AidPattern(a["aid_id"], a["period"], tuple(a["flashes"]))
+                for a in stored_aids
+            ]
+            _request_payload, response_payload = _run_judgment(
+                patterns,
+                observations,
+                thresholds,
+                library_source="stored",
+                library_version=library_version,
+            )
+            return response_payload
+
+        try:
+            body, created = app.state.db.adopt_batch_judgment_review_report(
+                device_id,
+                batch_judgment_id,
+                req.review_report_id,
+                req.idempotency_key,
+                runner,
+            )
+        except DeviceIsolated as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        except BatchJudgmentNotFound as exc:
+            raise HTTPException(status_code=404, detail=exc.detail)
+        except AdoptionNotFound as exc:
+            raise HTTPException(status_code=404, detail=exc.detail)
+        except AdoptionConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.get(
+        "/field-devices/{device_id}/batch-judgments/{batch_judgment_id}/adoptions",
+        summary="分页查询一次连续批次判定的采纳记录（按 adoption_id 升序，摘要）",
+    )
+    def list_device_batch_judgment_adoptions(
+        device_id: str = Path(min_length=1, max_length=128),
+        batch_judgment_id: int = Path(ge=1),
+        after_id: int = Query(0, ge=0, description="游标：返回 adoption_id 大于该值的记录"),
+        limit: int = Query(50, ge=1, le=200),
+    ) -> dict:
+        page = app.state.db.list_batch_judgment_adoptions(
+            device_id, batch_judgment_id, after_id=after_id, limit=limit
+        )
+        if page is None:
+            raise HTTPException(status_code=404, detail="batch judgment not found")
+        return page
+
+    @app.get(
+        "/field-devices/{device_id}/batch-judgments/{batch_judgment_id}/adoptions/{adoption_id}",
+        summary="查询单条采纳详情（原结果、现行结果、差异与来源报告快照）",
+    )
+    def get_device_batch_judgment_adoption(
+        device_id: str = Path(min_length=1, max_length=128),
+        batch_judgment_id: int = Path(ge=1),
+        adoption_id: int = Path(ge=1),
+    ) -> dict:
+        row = app.state.db.get_batch_judgment_adoption(
+            device_id, batch_judgment_id, adoption_id
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="adoption not found")
         return row
 
     # ---------------- 设备链一致性核验（只读快照） ----------------

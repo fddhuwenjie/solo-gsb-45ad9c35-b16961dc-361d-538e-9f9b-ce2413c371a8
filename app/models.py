@@ -304,6 +304,36 @@ class BatchJudgmentReviewRequest(BaseModel):
         return v
 
 
+class BatchJudgmentAdoptionRequest(BaseModel):
+    """采纳一份 ``changed`` 复核报告的新判定为批次判定的现行结果。
+
+    提交原批次判定路径之外的复核报告 id 与客户端幂等键：仅接受同设备、同
+    目标判定且结论为 ``changed`` 的报告。服务在单个 SQLite 写事务内重新
+    核对批次未归档且来源摘要、前序链、四项阈值与原判定一致，用原
+    ``library_version`` 重跑并核对结果与报告的新候选和差异；来源变化或
+    复核结果不一致返回 409 并整体回滚（不留下部分采纳）。成功后保存不可变
+    替代结果及来源报告，原判定与 ``/judgments`` 历史仍可查。相同幂等键 +
+    相同目标（含报告）重试返回原采纳（HTTP 200）；同键改目标或用其他键
+    争抢同一原判定返回 409。
+    """
+
+    review_report_id: int = Field(
+        ge=1, description="被采纳的复核报告 id（必须属于该设备与目标判定，且 status=changed）"
+    )
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（全局唯一；同键同目标重试返回原采纳）",
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _key_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("idempotency_key must not be blank")
+        return v
+
+
 class LeaseClaimRequest(BaseModel):
     """消费者领取批次处理租约。
 

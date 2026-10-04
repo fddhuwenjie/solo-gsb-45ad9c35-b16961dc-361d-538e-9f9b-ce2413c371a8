@@ -82,6 +82,16 @@
 `source_unavailable` / `source_mismatch` 及问题清单，**不写入
 `judgments`**。相同键重试返回原报告，改用其他设备或判定目标返回 409。
 
+复核为 `changed` 并经核实后，运维可**采纳**新判定为该批次判定的现行结果
+（`POST …/batch-judgments/{id}/adoptions`）：提交复核报告 ID 与幂等键，
+仅接收**同设备、同目标判定且为 `changed`** 的报告；服务在**单个 SQLite
+写事务**内重新核对批次未归档、来源摘要/前序链/阈值与原判定一致，用原
+`library_version` 重跑并核对结果与报告的新候选和差异，来源变化或复核结果
+不一致返回 409 且整体回滚（不留下部分采纳）。成功后保存**不可变替代结果**
+及来源报告，原判定和 `/judgments` 历史仍可查，原批次判定详情同时显示原
+结果与现行结果；同键同目标重试返回原采纳，改目标或用其他键争抢同一原判定
+返回 409。
+
 设备离线补传、归档或数据库迁移之后，运维可用
 `POST /field-devices/{device_id}/verify-chain` 对批次链做**一致性核验**，确认
 批次链仍可作为判定来源：提交设备编号与序号范围，服务在**单个只读 SQLite 事务**
@@ -168,10 +178,13 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `POST` | `/field-devices/{device_id}/batch-leases/{id}/recover` | 显式回收过期租约（held → revoked），回收后区间可重新领取（未过期/已完成 409，重复回收幂等） |
 | `POST` | `/field-devices/{device_id}/batch-judgments` | 对连续批次区间创建归档前巡检判定（幂等键；固定激活库版本，合并观测复用 `/judge`；重试 200，改范围/设备 409，含墓碑/缺批次/阈值不一致整体拒绝） |
 | `GET` | `/field-devices/{device_id}/batch-judgments` | 分页查询设备的连续批次判定（`after_id` 游标 + `limit`） |
-| `GET` | `/field-devices/{device_id}/batch-judgments/{id}` | 查询单次连续批次判定详情（不可变来源：序号范围、各批摘要、合并观测、阈值、`library_version`、判定结果） |
+| `GET` | `/field-devices/{device_id}/batch-judgments/{id}` | 查询单次连续批次判定详情（不可变来源：序号范围、各批摘要、合并观测、阈值、`library_version`、原判定结果；采纳后另含现行结果 `current_judgment` 与采纳摘要 `adoption`） |
 | `POST` | `/field-devices/{device_id}/batch-judgments/{id}/review-reports` | 复核一次连续批次判定（幂等键；只读快照逐批核对来源，一致时用保存版本特征库重跑：`unchanged`/`changed`/`source_unavailable`/`source_mismatch`，不写 `judgments`；重试 200，改设备/判定 409） |
 | `GET` | `/field-devices/{device_id}/batch-judgments/{id}/review-reports` | 分页查询一次判定的复核报告（`after_id` 游标 + `limit`，摘要） |
 | `GET` | `/field-devices/{device_id}/batch-judgments/{id}/review-reports/{rid}` | 查询单份复核报告详情（问题清单、差异字段与原/新候选证据） |
+| `POST` | `/field-devices/{device_id}/batch-judgments/{id}/adoptions` | 采纳 `changed` 复核报告的新判定为现行结果（报告 id + 幂等键；单写事务重核批次未归档且来源一致、用原 `library_version` 重跑并核对新候选与差异；来源变化/结果不符 409 整体回滚；成功保存不可变替代结果与来源报告，原判定与 `/judgments` 历史保留；同键同目标重试 200，改目标/他键争抢 409） |
+| `GET` | `/field-devices/{device_id}/batch-judgments/{id}/adoptions` | 分页查询一次判定的采纳记录（`after_id` 游标 + `limit`，摘要） |
+| `GET` | `/field-devices/{device_id}/batch-judgments/{id}/adoptions/{aid}` | 查询单条采纳详情（原结果、现行结果、差异与来源报告快照） |
 | `POST` | `/field-devices/{device_id}/verify-chain` | 核验设备批次链一致性（只读快照：重算范围内未归档批次摘要，核对链式引用/序号连续性/链游标/墓碑边界/消费者确认与水位/判定来源摘要；不改数据，空设备或缺批次 404） |
 | `POST` | `/field-devices/{device_id}/isolation` | 隔离设备（提交当前链头序号/摘要 + 原因 + 幂等键；同事务核对链头并记录不可变事件；隔离期间上传/确认/归档/租约领取与完成/批次判定 409；同键重试 200，链头不符或已隔离 409） |
 | `POST` | `/field-devices/{device_id}/isolation/release` | 解除隔离（提交核验范围 + 幂等键；同事务核对链头未变、范围核验 ok、无未完成租约，全部通过记录解除事件并恢复原流程；任一不满足 409 整体拒绝） |
@@ -1118,7 +1131,8 @@ curl -s -X POST $DEV/batch-judgments \
 curl -s "$DEV/batch-judgments?limit=20"
 curl -s "$DEV/batch-judgments?after_id=1&limit=20"
 
-# 单次详情：不可变来源（各批摘要 + 合并观测 + 完整判定证据）
+# 单次详情：不可变来源（各批摘要 + 合并观测 + 完整判定证据）；
+# 采纳后同一份详情另含 current_judgment（现行结果）与 adoption（采纳摘要）
 curl -s "$DEV/batch-judgments/1"
 # 不属于该设备的 id 返回 404
 ```
@@ -1257,6 +1271,128 @@ curl -s "$DEV/batch-judgments/1/review-reports?after_id=1&limit=20"
 
 # 单份报告详情（问题清单、差异字段与原/新候选证据）
 curl -s "$DEV/batch-judgments/1/review-reports/1"
+```
+
+### 9.6 采纳 changed 复核报告（让核实过的新判定成为现行结果）
+
+复核报告为 `changed` 表示**按原 `library_version` 从当前批次链重跑得到的
+结果与已保存判定不一致**。运维核实报告的差异与新候选证据无误后，可调用
+**采纳**接口让新判定成为该批次判定的**现行结果**。采纳不修改任何历史：
+原批次判定与底层 `judgments` 行原样保留，`/judgments` 历史仍可逐条查询；
+新结果作为一条**不可变替代判定**写入 `judgments`，并由一条不可变采纳记录
+（含来源报告完整快照）把原结果与现行结果关联起来。
+
+**请求体**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `review_report_id` | `int≥1` | 被采纳的复核报告 id；必须属于路径中的设备与批次判定，且结论为 `changed` |
+| `idempotency_key` | `string`（1~128） | 客户端生成的幂等键（全局唯一；网络重试复用同一键） |
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+
+# ① 先有一份 changed 复核报告（见 §9.5），记下 report_id
+curl -s -X POST $DEV/batch-judgments/1/review-reports \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key": "review-2026-10-04-01"}'
+# → {"report_id": 1, "status": "changed", "differences": [ … ],
+#    "saved": {"best_aid_id": "CN-009", …}, "current": {"best_aid_id": "CN-001", …}}
+
+# ② 采纳：提交复核报告 id 与新的幂等键
+curl -s -X POST $DEV/batch-judgments/1/adoptions \
+  -H 'Content-Type: application/json' \
+  -d '{"review_report_id": 1, "idempotency_key": "adopt-2026-10-04-01"}' \
+  | python3 -m json.tool
+```
+
+```json
+{
+  "adoption_id": 1,
+  "idempotency_key": "adopt-2026-10-04-01",
+  "device_id": "dev-01",
+  "batch_judgment_id": 1,
+  "review_report_id": 1,
+  "library_version": 2,
+  "adopted_at": "2026-10-04T07:00:00+00:00",
+  "original_judgment_id": 17,
+  "current_judgment_id": 18,
+  "original": {
+    "judgment_id": 17, "status": "matched", "reason": null,
+    "best_aid_id": "CN-009", "best": {"aid_id": "CN-009", "…": "…"}
+  },
+  "current": {
+    "judgment_id": 18, "status": "matched", "reason": null,
+    "best_aid_id": "CN-001", "best": {"aid_id": "CN-001", "…": "…"}
+  },
+  "current_judgment": {
+    "judgment_id": 18, "status": "matched", "library_source": "stored",
+    "library_version": 2, "best": {"aid_id": "CN-001", "…": "…"},
+    "candidates": [ … ], "parameters": {"tolerance": 0.5, "…": "…"}
+  },
+  "differences": [
+    {"field": "best.aid_id", "saved": "CN-009", "current": "CN-001"}
+  ],
+  "source_report": {"report_id": 1, "status": "changed", "…": "…"}
+}
+```
+
+**单事务内的重新核对与重跑**（全部在同一个 `BEGIN IMMEDIATE` 写事务内，
+任一步失败整体回滚，**不留下部分采纳**）：
+
+1. **报告合法性**：报告必须存在、属于路径中的同设备与同批次判定，且结论
+   为 `changed`；
+2. **批次未归档**：区间内批次明细必须仍在（无墓碑、无缺批次）——采纳要求
+   能从原始链数据**重跑**，归档墓碑只有摘要骨架、没有观测，不能采纳；
+3. **来源一致**：逐批核对来源摘要（含按保存明细重算规范 SHA-256）、
+   前序链（含区间首批的链锚）与四项阈值，全部与原判定保存值一致；
+4. **原 `library_version` 重跑**：用原判定固定的不可变特征库版本（与当前
+   激活版本无关）按合并观测重跑与 `/judge` 相同的判定算法；
+5. **与报告逐项核对**：重跑结果必须等于报告保存的新候选证据
+   （`current`），重跑差异必须等于报告的 `differences`，且报告的原候选
+   （`saved`）必须仍与当前原判定记录一致——防止报告生成后来源又变化或
+   报告/原判定被改写。
+
+**冲突响应（409）**：
+
+| `detail.reason` | 触发条件 |
+| --- | --- |
+| `review_report_not_changed` | 报告结论不是 `changed`（`unchanged` / `source_unavailable` / `source_mismatch`） |
+| `review_report_target_mismatch` | 报告属于其他设备或其他批次判定（附 `report_device_id` / `report_batch_judgment_id`） |
+| `source_unavailable` | 采纳时区间批次已归档为墓碑或已缺失（附复核 `issues` 清单） |
+| `source_mismatch` | 采纳时来源摘要/前序链/阈值与原判定不再一致（附 `issues` 清单） |
+| `review_result_mismatch` | 重跑的新候选或差异与报告不符，或报告原候选已与原判定记录不符（附 `mismatched_side` 及两侧值） |
+| `idempotency_key_in_use` | 同一幂等键已被其他设备/判定/报告的采纳占用（附占用方 id） |
+| `already_adopted` | 该原批次判定已有现行结果；用其他键再次争抢（附首次采纳 id 与报告 id） |
+
+报告不存在返回 `404 review_report_not_found`；目标判定不存在或不属于该
+设备返回 `404 batch_judgment_not_found`；设备隔离期间采纳返回
+`409 device_isolated`（采纳记录查询仍可用）。
+
+- **幂等**：相同幂等键 + 相同设备/判定/报告重试返回**原采纳**（HTTP 200，
+  `adoption_id` / 新判定 id / `adopted_at` 均不变），不会重复重跑落库；
+- **唯一性**：每个原批次判定**至多被采纳一次**（唯一约束兜底，他键争抢
+  409）；不同批次判定使用各自的采纳，互不影响；
+- **并发安全**：写锁串行化 + 幂等键唯一约束与「每判定一条采纳」唯一索引
+  兜底，同键并发恰好一份 201、其余 200，他键并发争抢只可能得到 409，绝不
+  写入两条替代判定；
+- **历史可查**：原批次判定详情 `GET …/batch-judgments/{id}` 同时给出
+  原结果 `judgment`、现行结果 `current_judgment` 与采纳摘要 `adoption`
+  （未采纳时后两者为 `null`）；列表接口的每条判定附
+  `adoption_id` / `current_judgment_id` / `adopted_at`；新/旧底层判定均可
+  在 `GET /judgments/{id}` 回溯，批次随后归档也不影响已采纳结果查询。
+
+```bash
+# 采纳记录查询（每个原判定至多一条；摘要 + 详情两级，同复核报告风格）
+curl -s "$DEV/batch-judgments/1/adoptions"
+curl -s "$DEV/batch-judgments/1/adoptions/1"
+
+# 原批次判定详情同时包含 judgment（原结果）与 current_judgment（现行结果）
+curl -s "$DEV/batch-judgments/1" | python3 -m json.tool
+
+# 新、旧底层判定都仍在 /judgments 历史中
+curl -s http://localhost:8000/judgments/17   # 原判定
+curl -s http://localhost:8000/judgments/18   # 采纳的现行判定
 ```
 
 ### 10. 设备链一致性核验（离线补传 / 归档 / 迁移后的运维核对）
@@ -1447,9 +1583,10 @@ curl -s -X POST $DEV/isolation \
 - `POST …/archive`（归档连续前缀）；
 - `POST …/batch-leases`（租约领取）与 `POST …/batch-leases/{id}/complete`
   （租约完成）；
-- `POST …/batch-judgments`（连续批次判定）。
+- `POST …/batch-judgments`（连续批次判定）；
+- `POST …/batch-judgments/{id}/adoptions`（采纳复核新判定为现行结果）。
 
-仍可使用：全部查询接口、`POST …/verify-chain`（链核验）、
+仍可使用：全部查询接口（含采纳记录查询）、`POST …/verify-chain`（链核验）、
 `POST …/batch-judgments/{id}/review-reports`（判定复核，只读核验类）、
 `POST …/batch-leases/{id}/recover`（回收已过期租约，解除闸门前清场）、
 消费者登记，以及隔离状态/事件查询。其他设备不受任何影响。
@@ -1586,7 +1723,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 消费者批次处理租约 + 草稿回放 + 连续批次判定 + 判定复核报告 + 链一致性核验 + 异常隔离共 236 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 消费者批次处理租约 + 草稿回放 + 连续批次判定 + 判定复核报告 + changed 复核采纳 + 链一致性核验 + 异常隔离共 264 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -1604,6 +1741,7 @@ app/
              设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑 +
              消费者批次处理租约（领取/完成/回收、租约占用归档闸门）+
              连续批次归档前巡检判定不可变来源 + 只读快照判定复核报告 +
+             changed 复核的不可变采纳（原结果与现行结果并存）+
              只读快照链一致性核验 +
              设备异常隔离不可变事件与处理接口闸门，含首次迁移）
   config.py  环境变量配置
